@@ -11,6 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Debug
+        run: |
+          pwd
+          ls -la
+          ls -la scripts/ || echo "scripts introuvable"
+
       - name: Fetch RSS feeds
         run: node scripts/fetch-rss.js
 
