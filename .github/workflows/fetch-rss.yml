@@ -11,16 +11,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Debug
-        run: |
-          pwd
-          ls -la
-          ls -la scripts/ || echo "scripts introuvable"
-
       - name: Fetch RSS feeds
         run: node scripts/fetch-rss.js
 
-      - name: Commit and push if changed
+      - name: Update last-run timestamp
+        run: date -u +"%Y-%m-%dT%H:%M:%SZ" > public/last-run.txt
+
+      - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
