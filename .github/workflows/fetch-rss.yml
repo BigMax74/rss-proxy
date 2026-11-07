@@ -2,25 +2,154 @@ name: Fetch RSS Feeds
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    # Une fois par heure, en évitant le début d'heure très chargé sur GitHub.
+    - cron: '17 * * * *'
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fetch-rss.yml'
+      - 'scripts/fetch-rss.js'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/fetch-rss.yml'
+      - 'scripts/fetch-rss.js'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  fetch:
-    runs-on: ubuntu-latest
+  check:
+    name: Vérifier une modification du workflow
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.x'
+          check-latest: true
+          package-manager-cache: false
+      - name: Vérifier le script et récupérer les flux sans publication
+        run: |
+          node --check scripts/fetch-rss.js
+          timeout --kill-after=5s 90s node scripts/fetch-rss.js
+      - name: Vérifier les données récupérées
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const assert = require('node:assert/strict');
+          for (const file of ['public/isles-aux-enfants.json', 'public/metzstories.json']) {
+            const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+            assert(typeof data.channelTitle === 'string' && data.channelTitle.trim(), `${file}: titre manquant`);
+            assert(Array.isArray(data.items) && data.items.length > 0, `${file}: liste d'épisodes vide`);
+            for (const item of data.items) {
+              assert(typeof item.title === 'string' && item.title.trim(), `${file}: épisode sans titre`);
+              assert(typeof item.audio === 'string' && /^https?:\/\//i.test(item.audio), `${file}: audio invalide`);
+            }
+            console.log(`${file}: ${data.items.length} épisodes valides`);
+          }
+          NODE
 
-      - name: Fetch RSS feeds
-        run: node scripts/fetch-rss.js
+  fetch:
+    name: Actualiser et publier les podcasts
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: rss-publication-main
+      cancel-in-progress: false
+    env:
+      GIT_TERMINAL_PROMPT: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
 
-      - name: Update last-run timestamp
+      - name: Installer la dernière version de Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24.x'
+          check-latest: true
+          package-manager-cache: false
+
+      - name: Récupérer et valider les flux avec nouvelles tentatives
+        run: |
+          set -euo pipefail
+          validate_feeds() {
+            node <<'NODE'
+          const fs = require('node:fs');
+          const assert = require('node:assert/strict');
+          for (const file of ['public/isles-aux-enfants.json', 'public/metzstories.json']) {
+            const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+            assert(typeof data.channelTitle === 'string' && data.channelTitle.trim(), `${file}: titre manquant`);
+            assert(Array.isArray(data.items) && data.items.length > 0, `${file}: liste d'épisodes vide`);
+            for (const item of data.items) {
+              assert(typeof item.title === 'string' && item.title.trim(), `${file}: épisode sans titre`);
+              assert(typeof item.audio === 'string' && /^https?:\/\//i.test(item.audio), `${file}: audio invalide`);
+            }
+            console.log(`${file}: ${data.items.length} épisodes valides`);
+          }
+          NODE
+          }
+          for attempt in 1 2 3; do
+            echo "Récupération RSS : tentative ${attempt}/3"
+            if timeout --kill-after=5s 90s node scripts/fetch-rss.js && validate_feeds; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::Récupération temporairement impossible ; nouvelle tentative automatique."
+              sleep "$((attempt * 10))"
+            fi
+          done
+          echo "::error::Les flux n'ont pas pu être récupérés et validés. Les fichiers déjà publiés sont conservés."
+          exit 1
+
+      - name: Actualiser la date de vérification
         run: date -u +"%Y-%m-%dT%H:%M:%SZ" > public/last-run.txt
 
-      - name: Commit and push
+      - name: Enregistrer et envoyer avec nouvelles tentatives
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add public/
-          git diff --staged --quiet || git commit -m "chore: update RSS feeds"
-          git push
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- public/isles-aux-enfants.json public/metzstories.json public/last-run.txt
+          if git diff --cached --quiet; then
+            echo "Aucune modification à publier."
+            exit 0
+          fi
+          git commit -m "chore: update RSS feeds"
+
+          for attempt in 1 2 3 4; do
+            echo "Publication GitHub : tentative ${attempt}/4"
+            if timeout --kill-after=5s 60s git fetch origin main; then
+              # Intègre les modifications arrivées depuis le checkout.
+              # En cas de vrai conflit, arrêt explicite plutôt qu'un écrasement.
+              if ! git rebase origin/main; then
+                git rebase --abort || true
+                echo "::error::Conflit avec une modification sur main. Aucun envoi forcé n'a été effectué."
+                exit 1
+              fi
+              if timeout --kill-after=5s 60s git push origin HEAD:main; then
+                echo "Publication terminée."
+                exit 0
+              fi
+            fi
+            if [ "$attempt" -lt 4 ]; then
+              echo "::warning::GitHub n'a pas accepté l'envoi ; nouvelle tentative automatique."
+              sleep "$((attempt * 10))"
+            fi
+          done
+          echo "::error::Publication impossible après 4 tentatives. Consulter l'erreur Git affichée ci-dessus ; le prochain lancement programmé réessaiera."
+          exit 1
